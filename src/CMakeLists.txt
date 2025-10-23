@@ -13,4 +13,5 @@ target_include_directories(peer_lib PUBLIC
 
 target_link_libraries(peer_lib PUBLIC
     cereal
+    Threads::Threads
 )

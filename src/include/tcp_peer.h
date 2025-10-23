@@ -9,7 +9,6 @@
 #include <memory>       // for std::shared_ptr
 #include <functional>   // for std::function
 
-// 前向声明，避免在头文件中包含 socket 头文件
 class TcpPeerImpl; 
 
 class TcpPeer {
