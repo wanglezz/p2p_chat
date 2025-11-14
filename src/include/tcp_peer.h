@@ -14,9 +14,8 @@ class TcpPeerImpl;
 class TcpPeer {
 public:
     TcpPeer();
-    ~TcpPeer(); // 析构函数现在很重要，需要关闭连接
+    ~TcpPeer(); 
 
-    // --- 公共 API ---
 
     /**
      * @brief 作为客户端连接到服务器
@@ -52,22 +51,17 @@ public:
     bool is_connected() const;
 
 private:
-    // --- 内部状态 ---
-    // (你已有的成员)
     ThreadSafeQueue<Message> send_queue_;
     std::atomic<bool> is_connected_ {false};
     std::atomic<bool> stop_flag_ {false};
 
-    // --- 新增成员 ---
     ThreadSafeQueue<Message> recv_queue_; // 用于接收消息
     std::thread sender_thread_;          // 发送线程
     std::thread receiver_thread_;        // 接收线程
-    int socket_fd_ = -1;                 // 我们的 socket 文件描述符
+    int socket_fd_ = -1;                 // socket 文件描述符
 
-    // --- 内部线程循环 ---
     void sender_loop();
     void receiver_loop();
 
-    // --- 内部辅助函数 ---
     void start_threads(); // 启动两个循环
 };
