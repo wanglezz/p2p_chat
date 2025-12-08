@@ -6,22 +6,15 @@
 
 std::string Message::serialize() const {
     std::stringstream ss;
-    { 
-        cereal::PortableBinaryOutputArchive oarchive(ss);
-        oarchive(*this); 
-    }
+    { cereal::PortableBinaryOutputArchive oarchive(ss); oarchive(*this); }
     return ss.str();
 }
 
 Message Message::deserialize(const std::string& data) {
     std::stringstream ss(data);
     Message msg; 
-    try {
-        cereal::PortableBinaryInputArchive iarchive(ss);
-        iarchive(msg); 
-    } catch (const std::exception& e) {
-        return Message::make_empty();
-    }
+    try { cereal::PortableBinaryInputArchive iarchive(ss); iarchive(msg); } 
+    catch (...) { return Message::make_empty(); }
     return msg; 
 }
 
@@ -74,19 +67,12 @@ Message Message::make_user_broadcast(MessageType type, SenderInfo user, std::vec
     return msg;
 }
 
-// --- Lab 3 实现 ---
+// --- Lab 3 文件与 P2P ---
 
 Message Message::make_file_header(SenderInfo sender, std::string target, std::string filename, uint64_t size) {
     Message msg;
     msg.type = MessageType::MSG_FILE_HEADER;
-    
-    // 自动判断模式：如果目标为空，则是群发
-    if (target.empty()) {
-        msg.chat_mode = ChatMode::MODE_GROUP;
-    } else {
-        msg.chat_mode = ChatMode::MODE_PRIVATE;
-    }
-
+    msg.chat_mode = target.empty() ? ChatMode::MODE_GROUP : ChatMode::MODE_PRIVATE;
     msg.sender = std::move(sender);
     msg.target_user = std::move(target);
     msg.file_name = std::move(filename);
@@ -98,17 +84,24 @@ Message Message::make_file_header(SenderInfo sender, std::string target, std::st
 Message Message::make_file_chunk(SenderInfo sender, std::string target, std::string data) {
     Message msg;
     msg.type = MessageType::MSG_FILE_DATA;
-
-    // 自动判断模式
-    if (target.empty()) {
-        msg.chat_mode = ChatMode::MODE_GROUP;
-    } else {
-        msg.chat_mode = ChatMode::MODE_PRIVATE;
-    }
-
+    msg.chat_mode = target.empty() ? ChatMode::MODE_GROUP : ChatMode::MODE_PRIVATE;
     msg.sender = std::move(sender);
     msg.target_user = std::move(target);
     msg.content = std::move(data);
+    msg.timestamp = std::time(nullptr);
+    return msg;
+}
+
+Message Message::make_p2p_request(SenderInfo sender, std::string target, std::string filename, uint64_t size, std::string ip, int port) {
+    Message msg;
+    msg.type = MessageType::MSG_P2P_TRANS_REQ;
+    msg.chat_mode = ChatMode::MODE_PRIVATE; // P2P 通常是点对点
+    msg.sender = std::move(sender);
+    msg.target_user = std::move(target);
+    msg.file_name = std::move(filename);
+    msg.file_size = size;
+    msg.p2p_server_ip = std::move(ip);
+    msg.p2p_server_port = port;
     msg.timestamp = std::time(nullptr);
     return msg;
 }
