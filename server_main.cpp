@@ -1,9 +1,9 @@
 #include <iostream>
 #include <string>
 #include <vector>
-#include <map>              // 用于存储 "用户名 -> socket" 的映射
+#include <map>              
 #include <thread>           
-#include <mutex>            // 用于保护共享的 map
+#include <mutex>            
 #include <stdexcept>
 #include <system_error>
 #include <cstring>
@@ -16,13 +16,17 @@
 
 #include "peer_message.h"
 
-// --- 全局共享状态 (必须用互斥锁保护) ---
-// 映射：用户名 -> socket 文件描述符
-std::map<std::string, int> g_clients;
-// 用于保护 g_clients 的互斥锁
-std::mutex g_clients_mutex;
-// ---
+// --- 全局常量与定义 ---
+constexpr int SERVER_PORT = 9001;           ///< 服务器监听端口
+constexpr size_t MAX_MSG_SIZE = 10 * 1024 * 1024; ///< 最大消息大小 (10MB)
 
+// --- 全局共享状态 (需互斥锁保护) ---
+std::map<std::string, int> g_clients;       ///< 用户名 -> socket 映射
+std::mutex g_clients_mutex;                 ///< 保护 g_clients 的互斥锁
+
+/**
+ * @brief 健壮地写入 N 字节
+ */
 bool robust_write(int fd, const void* data, size_t count) {
     const char* buffer = static_cast<const char*>(data);
     size_t written = 0;
@@ -34,6 +38,9 @@ bool robust_write(int fd, const void* data, size_t count) {
     return true;
 }
 
+/**
+ * @brief 健壮地读取 N 字节
+ */
 bool robust_read(int fd, void* data, size_t count) {
     char* buffer = static_cast<char*>(data);
     size_t read_bytes = 0;
@@ -46,11 +53,10 @@ bool robust_read(int fd, void* data, size_t count) {
 }
 
 /**
- * @brief 从全局 map 中获取当前在线用户列表 (线程安全)
+ * @brief 获取当前在线用户列表 (线程安全)
  */
 std::vector<std::string> GetOnlineUserList() {
     std::vector<std::string> user_list;
-    // 锁住互斥锁，防止在迭代时 map 被修改
     std::lock_guard<std::mutex> lock(g_clients_mutex);
     
     for (const auto& pair : g_clients) {
@@ -60,32 +66,43 @@ std::vector<std::string> GetOnlineUserList() {
 }
 
 /**
- * @brief 将一条消息广播给所有连接的客户端 (线程安全)
+ * @brief 广播消息给所有客户端 (线程安全)
  */
 void BroadcastMessage(const Message& msg) {
-    // 序列化消息一次，供所有客户端使用
     std::string data = msg.serialize();
     uint32_t len = data.length();
     uint32_t len_net = htonl(len);
 
-    // 锁住互斥锁，安全地迭代 g_clients
     std::lock_guard<std::mutex> lock(g_clients_mutex);
     
     for (const auto& pair : g_clients) {
         int client_fd = pair.second;
-        // 1. 发送长度前缀
         if (!robust_write(client_fd, &len_net, sizeof(len_net))) {
-            std::cerr << "Broadcast: Failed to write len to " << pair.first << std::endl;
+            std::cerr << "[Warning] Broadcast write len failed for " << pair.first << std::endl;
         }
-        // 2. 发送数据
         if (!robust_write(client_fd, data.data(), len)) {
-            std::cerr << "Broadcast: Failed to write data to " << pair.first << std::endl;
+            std::cerr << "[Warning] Broadcast write data failed for " << pair.first << std::endl;
         }
     }
 }
 
 /**
- * @brief 处理单个客户端所有通信的函数 (在单独的线程中运行)
+ * @brief 辅助函数：将序列化后的消息发送给指定用户
+ */
+void SendSerializedMessageToUser(const std::string& target_user, const std::string& serialized_data) {
+    uint32_t len = serialized_data.length();
+    uint32_t len_net = htonl(len);
+
+    std::lock_guard<std::mutex> lock(g_clients_mutex);
+    if (g_clients.count(target_user)) {
+        int fd = g_clients[target_user];
+        robust_write(fd, &len_net, sizeof(len_net));
+        robust_write(fd, serialized_data.data(), len);
+    }
+}
+
+/**
+ * @brief 客户端处理线程函数
  */
 void ClientHandler(int client_socket_fd) {
     std::string username;
@@ -93,7 +110,6 @@ void ClientHandler(int client_socket_fd) {
 
     try {
         // --- 1. 登录阶段 ---
-        // 客户端连接后发送的第一条消息必须是登录请求
         uint32_t len_net_login;
         if (!robust_read(client_socket_fd, &len_net_login, sizeof(len_net_login))) {
             throw std::runtime_error("Failed to read login msg len");
@@ -114,84 +130,91 @@ void ClientHandler(int client_socket_fd) {
         }
         
         username = login_msg.sender.name;
-        sender_info = std::move(login_msg.sender); // 保存 SenderInfo 以备后用
+        sender_info = std::move(login_msg.sender); 
 
-        // --- 2. 注册用户 (线程安全) ---
-        { // 互斥锁的单独作用域
+        // 注册用户
+        { 
             std::lock_guard<std::mutex> lock(g_clients_mutex);
             if (g_clients.count(username)) {
-                // (可选: 发送一条错误消息回客户端)
                 throw std::runtime_error("Username " + username + " already taken.");
             }
-            g_clients[username] = client_socket_fd; // 注册用户
+            g_clients[username] = client_socket_fd; 
         }
 
-        std::cout << "[Server] User '" << username << "' connected. Socket: " << client_socket_fd << std::endl;
+        std::cout << "[Server] User '" << username << "' connected." << std::endl;
         
-        // --- 3. 广播用户加入 & 发送用户列表  ---
+        // 广播用户加入
         std::vector<std::string> user_list = GetOnlineUserList();
         Message join_broadcast = Message::make_user_broadcast(
             MessageType::MSG_USER_JOIN_BCAST, 
-            std::move(sender_info), // 发送者是刚加入的用户
+            std::move(sender_info), 
             user_list
         );
         BroadcastMessage(join_broadcast);
 
-        // --- 4. 消息循环 ---
+        // --- 2. 消息处理循环 ---
         while (true) {
+            // 读取长度
             uint32_t len_net;
-            if (!robust_read(client_socket_fd, &len_net, sizeof(len_net))) {
-                // 读取失败 = 客户端断开连接
-                break;
-            }
+            if (!robust_read(client_socket_fd, &len_net, sizeof(len_net))) break;
             uint32_t len = ntohl(len_net);
 
-            if (len == 0 || len > 10 * 1024 * 1024) { // 10MB 限制
-                std::cerr << "Invalid message length " << len << " from " << username << std::endl;
-                continue; // 忽略此消息并继续
+            if (len == 0 || len > MAX_MSG_SIZE) { 
+                std::cerr << "[Error] Invalid message length " << len << " from " << username << std::endl;
+                // 这里选择断开连接，防止异常数据流
+                break; 
             }
 
+            // 读取内容
             std::string buffer(len, '\0');
-            if (!robust_read(client_socket_fd, buffer.data(), len)) {
-                // 读取失败 = 客户端断开连接
-                break;
-            }
+            if (!robust_read(client_socket_fd, buffer.data(), len)) break;
 
             Message msg = Message::deserialize(buffer);
 
-            // --- 5. 消息转发逻辑 ---
+            // --- 消息分发逻辑 ---
             switch (msg.type) {
                 case MessageType::MSG_CHAT:
                     if (msg.chat_mode == ChatMode::MODE_GROUP) {
-                        // A. 群发
-                        std::cout << "[Server] Group chat from '" << msg.sender.name << "': " << msg.content << std::endl;
+                        // 群聊广播
+                        std::cout << "[Chat] Group: " << msg.sender.name << " -> All" << std::endl;
                         BroadcastMessage(msg);
                     } 
                     else if (msg.chat_mode == ChatMode::MODE_PRIVATE) {
-                        // B. 私聊
-                        std::cout << "[Server] Private chat from '" << msg.sender.name << "' to '" << msg.target_user << "'" << std::endl;
+                        // 私聊转发
+                        std::cout << "[Chat] Private: " << msg.sender.name << " -> " << msg.target_user << std::endl;
                         
-                        // 序列化一次
                         std::string data = msg.serialize();
-                        uint32_t data_len = data.length();
-                        uint32_t data_len_net = htonl(data_len);
-
-                        std::lock_guard<std::mutex> lock(g_clients_mutex);
-                        
                         // 1. 发给目标
-                        if (g_clients.count(msg.target_user)) {
-                            int target_fd = g_clients[msg.target_user];
-                            robust_write(target_fd, &data_len_net, sizeof(data_len_net));
-                            robust_write(target_fd, data.data(), data_len);
-                        }
-                        // 2. 也发给自己，作为 "已发送" 确认
-                        robust_write(client_socket_fd, &data_len_net, sizeof(data_len_net));
-                        robust_write(client_socket_fd, data.data(), data_len);
+                        SendSerializedMessageToUser(msg.target_user, data);
+                        // 2. 发给自己 (回显)
+                        SendSerializedMessageToUser(username, data);
                     }
                     break;
                 
+                // --- Lab 3 文件传输处理 ---
+                case MessageType::MSG_FILE_HEADER:
+                case MessageType::MSG_FILE_DATA: 
+                {
+                    if (msg.chat_mode == ChatMode::MODE_GROUP) {
+                        if (msg.type == MessageType::MSG_FILE_HEADER) {
+                            std::cout << "[File] Group Broadcast: " << msg.sender.name 
+                                    << " -> All (" << msg.file_name << ")" << std::endl;
+                        }
+                        BroadcastMessage(msg);
+                    }
+                    // 文件传输视为私聊的一种特殊形式，直接转发
+                    if (msg.type == MessageType::MSG_FILE_HEADER) {
+                        std::cout << "[File] Header: " << msg.sender.name << " -> " << msg.target_user 
+                                  << " (" << msg.file_name << ")" << std::endl;
+                    } 
+                    std::string data = msg.serialize();
+                    SendSerializedMessageToUser(msg.target_user, data);
+                    // 注意：文件数据通常不回显给自己，节省带宽
+                    break;
+                }
+
                 default:
-                    std::cerr << "[Server] Unknown message type " << (int)msg.type << " from " << username << std::endl;
+                    std::cerr << "[Warning] Unknown message type from " << username << std::endl;
             }
         }
     
@@ -199,21 +222,17 @@ void ClientHandler(int client_socket_fd) {
         std::cerr << "[Handler Error] " << e.what() << std::endl;
     }
 
-    // --- 6. 清理阶段 (客户端断开连接) ---
+    // --- 3. 清理 ---
     std::cout << "[Server] User '" << username << "' disconnected." << std::endl;
-    
-    // 从全局 map 中移除 (线程安全)
     {
         std::lock_guard<std::mutex> lock(g_clients_mutex);
         g_clients.erase(username);
     }
-    
-    // 关闭 socket
     close(client_socket_fd);
 
-    // 广播用户离开 [cite: 527]
+    // 广播用户离开
     std::vector<std::string> user_list = GetOnlineUserList();
-    SenderInfo exit_sender; // 创建一个临时的 SenderInfo
+    SenderInfo exit_sender; 
     exit_sender.name = username;
     Message exit_broadcast = Message::make_user_broadcast(
         MessageType::MSG_USER_EXIT_BCAST,
@@ -221,69 +240,48 @@ void ClientHandler(int client_socket_fd) {
         user_list
     );
     BroadcastMessage(exit_broadcast);
-    
-    // 线程函数结束，此线程被销毁
 }
 
-/**
- * @brief 主线程：负责监听和接受新连接
- */
 int main() {
-    int port = 9001; // 硬编码端口号
-
-    // --- 1. 创建监听 socket ---
     int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (listen_fd < 0) {
         std::cerr << "Error: socket creation failed. " << strerror(errno) << std::endl;
         return 1;
     }
 
-    // 允许地址重用 (非常重要)
     int opt = 1;
     setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
-    // --- 2. 准备地址并绑定 ---
     sockaddr_in server_addr;
     memset(&server_addr, 0, sizeof(server_addr));
     server_addr.sin_family = AF_INET;
-    server_addr.sin_addr.s_addr = INADDR_ANY; // 监听所有网卡
-    server_addr.sin_port = htons(port);
+    server_addr.sin_addr.s_addr = INADDR_ANY; 
+    server_addr.sin_port = htons(SERVER_PORT);
 
     if (::bind(listen_fd, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
         std::cerr << "Error: bind failed. " << strerror(errno) << std::endl;
-        ::close(listen_fd);
+        close(listen_fd);
         return 1;
     }
 
-    // --- 3. 监听 ---
-    if (::listen(listen_fd, 10) < 0) { // 允许最多 10 个连接排队
+    if (::listen(listen_fd, 10) < 0) { 
         std::cerr << "Error: listen failed. " << strerror(errno) << std::endl;
-        ::close(listen_fd);
+        close(listen_fd);
         return 1;
     }
 
-    std::cout << "[Server] ChatServer listening on port " << port << "..." << std::endl;
+    std::cout << "[Server] ChatServer listening on port " << SERVER_PORT << "..." << std::endl;
 
-    // --- 4. 主循环：接受新连接  ---
     while (true) {
         sockaddr_in client_addr;
         socklen_t client_len = sizeof(client_addr);
-        
-        // 阻塞，直到有新客户端连接
         int client_socket_fd = ::accept(listen_fd, (struct sockaddr*)&client_addr, &client_len);
 
         if (client_socket_fd < 0) {
             std::cerr << "Error: accept failed. " << strerror(errno) << std::endl;
-            continue; // 继续下一个循环，而不是退出
+            continue; 
         }
 
-        char client_ip[INET_ADDRSTRLEN];
-        inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, INET_ADDRSTRLEN);
-        std::cout << "[Server] Accepted new connection from " << client_ip << std::endl;
-
-        // --- 5. 并发处理 ---
-        // 为这个新客户端创建一个单独的线程来处理它
-        // .detach() 使线程在后台运行，主线程不用管它
         try {
             std::thread(ClientHandler, client_socket_fd).detach();
         } catch (const std::system_error& e) {
@@ -291,8 +289,6 @@ int main() {
             close(client_socket_fd);
         }
     }
-
-    // (主循环永远不会退出，除非程序被终止)
     close(listen_fd);
     return 0;
 }

@@ -1,159 +1,129 @@
 #include <iostream>
 #include <string>
 #include <vector>
+#include <map>          // 新增
 #include <thread>
-#include <mutex>      // *** 1. 新增: 包含 <mutex> ***
+#include <mutex>
+#include <fstream>
+#include <iomanip>
 
-// ImGui 和后端
 #include "imgui.h"
 #include "imgui_impl_sdl2.h"
 #include "imgui_impl_sdlrenderer2.h"
-
-// SDL2
 #include <SDL2/SDL.h>
 
-// 我们的网络库
 #include "tcp_peer.h"
-#include "peer_message.h" // 确保这是 Lab 2 的新版本
+#include "peer_message.h" 
 
-// 全局 Peer 对象
+// --- 全局状态 ---
 std::shared_ptr<TcpPeer> g_peer = std::make_shared<TcpPeer>();
 
-// --- 2. 新/旧 全局变量 ---
-std::vector<std::string> g_chat_history;
+// [修改] 聊天记录分离： Key -> 聊天列表
+// Key: 如果是群聊，使用特殊 ID；如果是私聊，使用对方用户名
+std::map<std::string, std::vector<std::string>> g_chat_histories;
+const std::string GROUP_ID = "___GROUP_CHAT___"; 
 std::mutex g_chat_mutex; 
 
 std::vector<std::string> g_online_users;
 std::mutex g_online_users_mutex;
-std::string g_private_chat_target; // 用于跟踪私聊对象
-// ---
 
-// 添加一条消息到聊天记录 (线程安全)
-void AddToHistory(std::string message) {
+std::string g_private_chat_target; // 当前选中的私聊对象 (空表示群聊)
+
+// [修改] 文件接收状态
+struct FileRecvState {
+    bool is_receiving = false;
+    std::string filename;
+    uint64_t total_size = 0;
+    uint64_t received_size = 0;
+    std::ofstream file_stream;
+    std::string sender_name;
+};
+FileRecvState g_file_state;
+
+// --- 辅助函数 ---
+
+// [修改] 添加到指定历史
+void AddToHistory(const std::string& target_key, std::string message) {
     std::lock_guard<std::mutex> lock(g_chat_mutex);
-    g_chat_history.push_back(std::move(message));
+    g_chat_histories[target_key].push_back(std::move(message));
 }
 
-// 更新在线用户列表 (线程安全)
 void UpdateUserList(std::vector<std::string> new_list) {
     std::lock_guard<std::mutex> lock(g_online_users_mutex);
     g_online_users = std::move(new_list);
 }
 
-// GUI 状态
-enum class AppState {
-    Connecting, // 也可以叫 Login
-    Chatting,
-    Disconnected // (这个状态在当前逻辑中未使用，但保留)
-};
+enum class AppState { Connecting, Chatting };
 
-
+// --- 主程序 ---
 int main(int argc, char* argv[]) {
-    // --- 1. 初始化 SDL --- (不变)
-    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_TIMER) != 0) {
-        std::cerr << "Error: " << SDL_GetError() << std::endl;
-        return -1;
-    }
-
-    // --- 2. 创建窗口和渲染器 --- (不变)
+    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_TIMER) != 0) return -1;
+    
+    // 创建窗口
     SDL_WindowFlags window_flags = (SDL_WindowFlags)(SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI);
-    SDL_Window* window = SDL_CreateWindow("Multi-Chat Client (Lab 2)", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 1280, 720, window_flags);
+    SDL_Window* window = SDL_CreateWindow("Lab3 Chat Client", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 1280, 720, window_flags);
     SDL_Renderer* renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_PRESENTVSYNC | SDL_RENDERER_ACCELERATED);
 
-    // --- 3. 初始化 ImGui (包括字体) --- (不变)
+    // ImGui 初始化
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO(); (void)io;
-    {
-        const char* font_path = "/mnt/c/Windows/Fonts/msyh.ttc";
-        float font_size = 18.0f;
-        static ImVector<ImWchar> glyph_ranges;
-        ImFontGlyphRangesBuilder builder;
-        builder.AddRanges(io.Fonts->GetGlyphRangesDefault());
-        builder.AddRanges(io.Fonts->GetGlyphRangesChineseSimplifiedCommon());
-        builder.BuildRanges(&glyph_ranges);
-        std::cout << "Loading font: " << font_path << std::endl;
-        ImFont* font = io.Fonts->AddFontFromFileTTF(font_path, font_size, nullptr, glyph_ranges.Data);
-        if (font == nullptr) {
-            std::cerr << "Warning: Failed to load font. Using default." << std::endl;
-            io.Fonts->AddFontDefault();
-        } else {
-             std::cout << "Successfully loaded font." << std::endl;
-        }
-    }
+    // 请确保字体路径正确，否则中文可能乱码
+    const char* font_path = "/mnt/c/Windows/Fonts/msyh.ttc"; 
+    io.Fonts->AddFontFromFileTTF(font_path, 18.0f, nullptr, io.Fonts->GetGlyphRangesChineseSimplifiedCommon());
+    
     ImGui_ImplSDL2_InitForSDLRenderer(window, renderer);
     ImGui_ImplSDLRenderer2_Init(renderer);
     ImGui::StyleColorsDark();
 
-    // --- 4. 我们的状态变量 --- (不变)
+    // 应用变量
     AppState app_state = AppState::Connecting;
-    char ip_buffer[128] = "127.0.0.1"; // 默认服务器 IP
-    char port_buffer[32] = "9001";     // 默认服务器端口
+    char ip_buffer[128] = "127.0.0.1"; 
+    char port_buffer[32] = "9001";     
     char name_buffer[64] = "User";
     char message_buffer[1024] = "";
-    
-    // --- 5. 主循环 ---
+    char file_path_buffer[256] = "";
+
     bool running = true;
     while (running) {
-        // --- 5a. 处理事件 --- (不变)
         SDL_Event event;
         while (SDL_PollEvent(&event)) {
             ImGui_ImplSDL2_ProcessEvent(&event);
-            if (event.type == SDL_QUIT) {
-                running = false;
-            }
+            if (event.type == SDL_QUIT) running = false;
         }
 
-        // --- 5b. ImGui 新一帧 --- (不变)
         ImGui_ImplSDLRenderer2_NewFrame();
         ImGui_ImplSDL2_NewFrame();
         ImGui::NewFrame();
 
-        // --- 5c. 绘制我们的 GUI ---
-        ImGui::SetNextWindowSize(ImVec2(500, 400), ImGuiCond_FirstUseEver);
-
-        // --- 3. "连接" 界面 (已修改) ---
+        // --- 1. 登录界面 ---
         if (app_state == AppState::Connecting) {
-            ImGui::Begin("Login to Server");
-            ImGui::InputText("Your Name", name_buffer, 64);
-            ImGui::InputText("Server IP", ip_buffer, 128);
-            ImGui::InputText("Server Port", port_buffer, 32);
+            ImGui::Begin("Login");
+            ImGui::InputText("Username", name_buffer, 64);
+            ImGui::InputText("IP", ip_buffer, 128);
+            ImGui::InputText("Port", port_buffer, 32);
 
-            // *** "Listen" 按钮已删除 ***
-
-            if (ImGui::Button("Login")) {
-                std::cout << "Starting Connect thread..." << std::endl;
+            if (ImGui::Button("Connect")) {
                 std::string ip = ip_buffer;
                 int port = std::stoi(port_buffer);
-                std::string name = name_buffer; // 捕获用户名
-
-                // (重要!) 在新线程中运行阻塞的 connect_to
-                std::thread([ip, port, name]() { // *** 传递 name ***
+                std::string name = name_buffer;
+                std::thread([ip, port, name]() { 
                     if (g_peer->connect_to(ip, port)) {
-                        AddToHistory("--- Successfully connected to server ---");
-                        
-                        // *** 立即发送登录请求 ***
-                        SenderInfo sender;
-                        sender.name = name;
-                        Message login_msg = Message::make_login_request(std::move(sender));
-                        g_peer->send_message(std::move(login_msg));
-                        
-                    } else {
-                        AddToHistory("--- Connect failed ---");
+                        AddToHistory(GROUP_ID, "--- Connected ---");
+                        SenderInfo sender; sender.name = name;
+                        g_peer->send_message(Message::make_login_request(std::move(sender)));
                     }
                 }).detach();
             }
             ImGui::End();
 
-        // --- 4. "聊天" 界面 (已修改) ---
+        // --- 2. 聊天界面 ---
         } else if (app_state == AppState::Chatting) {
-            
-            // === 绘制“在线用户”窗口 (新增) ===
-            ImGui::SetNextWindowSize(ImVec2(200, 400), ImGuiCond_FirstUseEver);
+            // A. 左侧列表
+            ImGui::SetNextWindowSize(ImVec2(250, 500), ImGuiCond_FirstUseEver);
             ImGui::Begin("Online Users");
             
-            // 按钮：点击以清除私聊目标，返回群聊
-            if (ImGui::Button("Chat with: [GROUP]")) {
-                g_private_chat_target = "";
+            if (ImGui::Button("Group Chat (All)")) {
+                g_private_chat_target = ""; // 切换回群聊
             }
             ImGui::Separator();
             
@@ -162,148 +132,210 @@ int main(int argc, char* argv[]) {
                 if (user == name_buffer) {
                     ImGui::Text("%s (You)", user.c_str());
                 } else {
-                    // 使命字可被点击，用于选择私聊
-                    if (ImGui::Selectable(user.c_str(), user == g_private_chat_target)) {
-                        g_private_chat_target = user;
+                    bool is_selected = (user == g_private_chat_target);
+                    if (ImGui::Selectable(user.c_str(), is_selected)) {
+                        g_private_chat_target = user; // 切换到私聊
                     }
                 }
             }
             g_online_users_mutex.unlock();
             ImGui::End();
 
+            // B. 聊天窗口
+            std::string current_view_key = g_private_chat_target.empty() ? GROUP_ID : g_private_chat_target;
+            std::string title = g_private_chat_target.empty() ? "Group Chat" : ("Private with " + g_private_chat_target);
 
-            // === 绘制“聊天”窗口 (修改) ===
-            std::string chat_title = "Chat - ";
-            if (g_private_chat_target.empty()) {
-                chat_title += "[GROUP]";
-            } else {
-                chat_title += "[Private with " + g_private_chat_target + "]";
-            }
-            ImGui::Begin(chat_title.c_str());
+            ImGui::Begin(title.c_str());
+            ImGui::BeginChild("History", ImVec2(0, -120)); // 留空间给下方控件
             
-            // 显示聊天记录 (不变)
-            ImGui::BeginChild("History", ImVec2(0, -ImGui::GetFrameHeightWithSpacing() * 2));
+            // 显示对应 Key 的历史记录
             g_chat_mutex.lock();
-            for (const auto& line : g_chat_history) {
+            const auto& history = g_chat_histories[current_view_key];
+            for (const auto& line : history) {
                 ImGui::TextWrapped("%s", line.c_str());
             }
-            if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY())
-                ImGui::SetScrollHereY(1.0f);
+            if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY()) ImGui::SetScrollHereY(1.0f);
             g_chat_mutex.unlock();
+            
             ImGui::EndChild();
+            ImGui::Separator();
 
-            // 输入框 (修改了发送逻辑)
-            bool text_entered = ImGui::InputText("Message", message_buffer, 1024, ImGuiInputTextFlags_EnterReturnsTrue);
+            // C. 文本发送
+            bool send_text = ImGui::InputText("Message", message_buffer, 1024, ImGuiInputTextFlags_EnterReturnsTrue);
             ImGui::SameLine();
-            bool send_clicked = ImGui::Button("Send");
-
-            if (text_entered || send_clicked) {
+            if (ImGui::Button("Send") || send_text) {
                 if (strlen(message_buffer) > 0) {
-                    SenderInfo sender;
-                    sender.name = name_buffer;
-                    std::string content = message_buffer;
-                    
+                    SenderInfo sender; sender.name = name_buffer;
                     Message msg;
-                    std::string my_message_prefix;
-
-                    // *** 检查是群聊还是私聊 ***
+                    // 发送逻辑 + 本地显示逻辑
                     if (g_private_chat_target.empty()) {
-                        // 1. 创建群聊消息
-                        msg = Message::make_group_chat(std::move(sender), content);
-                        my_message_prefix = "[You to Group]: ";
+                        msg = Message::make_group_chat(std::move(sender), message_buffer);
+                        AddToHistory(GROUP_ID, "[Me]: " + std::string(message_buffer));
                     } else {
-                        // 2. 创建私聊消息
-                        msg = Message::make_private_chat(std::move(sender), g_private_chat_target, content);
-                        my_message_prefix = "[You to " + g_private_chat_target + "]: ";
+                        msg = Message::make_private_chat(std::move(sender), g_private_chat_target, message_buffer);
+                        AddToHistory(g_private_chat_target, "[Me -> " + g_private_chat_target + "]: " + std::string(message_buffer));
                     }
-                    
                     g_peer->send_message(std::move(msg));
-
-                    // 立即在本地显示
-                    AddToHistory(my_message_prefix + content);
-                    
-                    // 清空输入框
                     memset(message_buffer, 0, 1024);
-                    ImGui::SetKeyboardFocusHere(-1); // 重新聚焦输入框
+                    ImGui::SetKeyboardFocusHere(-1);
                 }
             }
+
+            // D. 文件发送 (支持群发和私发)
+            ImGui::Separator();
+            if (g_private_chat_target.empty()) ImGui::Text("Send File (Group Broadcast):");
+            else ImGui::Text("Send File (Private):");
+
+            ImGui::InputText("Path", file_path_buffer, 256);
+            ImGui::SameLine();
+            if (ImGui::Button("Send File")) {
+                std::string filepath = file_path_buffer;
+                std::string target = g_private_chat_target;
+                std::string my_name = name_buffer;
+
+                std::thread([filepath, target, my_name]() {
+                    std::ifstream ifs(filepath, std::ios::binary | std::ios::ate);
+                    if (!ifs) {
+                        // 错误信息显示在当前视图
+                        AddToHistory(target.empty() ? GROUP_ID : target, "[System]: Open file failed.");
+                        return;
+                    }
+                    uint64_t filesize = ifs.tellg();
+                    ifs.seekg(0, std::ios::beg);
+                    std::string filename = filepath.substr(filepath.find_last_of("/\\") + 1);
+
+                    AddToHistory(target.empty() ? GROUP_ID : target, "[System]: Sending '" + filename + "'...");
+
+                    // 1. 发送 Header (使用 std::move 修复编译错误)
+                    {
+                        SenderInfo s; s.name = my_name;
+                        g_peer->send_message(Message::make_file_header(std::move(s), target, filename, filesize));
+                    }
+
+                    // 2. 发送 Body
+                    const size_t CHUNK = 8192;
+                    char buf[CHUNK];
+                    while (ifs.read(buf, CHUNK) || ifs.gcount() > 0) {
+                        std::string data(buf, ifs.gcount());
+                        SenderInfo s; s.name = my_name; // 每次循环新建
+                        g_peer->send_message(Message::make_file_chunk(std::move(s), target, data));
+                        std::this_thread::sleep_for(std::chrono::microseconds(50));
+                    }
+                    AddToHistory(target.empty() ? GROUP_ID : target, "[System]: File sent.");
+                }).detach();
+            }
+
+            // E. 接收进度条
+            if (g_file_state.is_receiving) {
+                ImGui::Separator();
+                float prog = (g_file_state.total_size > 0) ? (float)g_file_state.received_size / g_file_state.total_size : 0.0f;
+                ImGui::Text("Receiving '%s' from %s...", g_file_state.filename.c_str(), g_file_state.sender_name.c_str());
+                ImGui::ProgressBar(prog, ImVec2(0.0f, 0.0f));
+            }
+
             ImGui::End();
         }
 
-        // --- 5d. 网络逻辑 (非阻塞) ---
-
-        // 检查连接状态，切换窗口 (不变)
-        if (g_peer->is_connected() && app_state == AppState::Connecting) {
-            app_state = AppState::Chatting;
-        } else if (!g_peer->is_connected() && app_state == AppState::Chatting) {
+        // --- 状态检测 ---
+        if (g_peer->is_connected() && app_state == AppState::Connecting) app_state = AppState::Chatting;
+        if (!g_peer->is_connected() && app_state == AppState::Chatting) {
             app_state = AppState::Connecting;
-            AddToHistory("--- Connection lost ---");
-            UpdateUserList({}); // 清空用户列表
-            g_private_chat_target = ""; // 重置私聊
+            g_private_chat_target = "";
         }
 
-        // --- 5. "接收" 逻辑 (已修改) ---
-        Message received_msg;
-        if (g_peer->try_recv_message(received_msg)) {
-            std::string history_line;
-            
-            // *** 使用 switch 处理所有新消息类型 ***
-            switch (received_msg.type) {
+        // --- 3. 消息接收处理 ---
+        Message rmsg;
+        while (g_peer->try_recv_message(rmsg)) {
+            switch (rmsg.type) {
                 case MessageType::MSG_CHAT:
-                    if (received_msg.chat_mode == ChatMode::MODE_PRIVATE) {
-                        history_line = "[Private from " + received_msg.sender.name + "]: ";
+                    if (rmsg.chat_mode == ChatMode::MODE_PRIVATE) {
+                        // 私聊：存入对方名字的历史
+                        if (rmsg.sender.name != name_buffer) {
+                             AddToHistory(rmsg.sender.name, "[Private from " + rmsg.sender.name + "]: " + rmsg.content);
+                        }
                     } else {
-                        history_line = "[" + received_msg.sender.name + "]: ";
+                        // 群聊：存入 GROUP_ID
+                        // [关键] 过滤掉自己发的消息，防止回声
+                        if (rmsg.sender.name != name_buffer) {
+                            AddToHistory(GROUP_ID, "[" + rmsg.sender.name + "]: " + rmsg.content);
+                        }
                     }
-                    history_line += received_msg.content;
-                    AddToHistory(history_line);
                     break;
                 
                 case MessageType::MSG_USER_JOIN_BCAST:
-                    history_line = "--- User '" + received_msg.sender.name + "' has joined. ---";
-                    AddToHistory(history_line);
-                    UpdateUserList(std::move(received_msg.user_list));
+                    AddToHistory(GROUP_ID, "--- " + rmsg.sender.name + " joined ---");
+                    UpdateUserList(std::move(rmsg.user_list));
                     break;
-                    
                 case MessageType::MSG_USER_EXIT_BCAST:
-                    history_line = "--- User '" + received_msg.sender.name + "' has left. ---";
-                    AddToHistory(history_line);
-                    UpdateUserList(std::move(received_msg.user_list));
+                    AddToHistory(GROUP_ID, "--- " + rmsg.sender.name + " left ---");
+                    UpdateUserList(std::move(rmsg.user_list));
                     break;
-
                 case MessageType::MSG_USER_LIST_BCAST:
-                    // (通常在刚登录时收到)
-                    AddToHistory("--- You are now online. ---");
-                    UpdateUserList(std::move(received_msg.user_list));
+                    UpdateUserList(std::move(rmsg.user_list));
                     break;
 
-                case MessageType::MSG_SYS_ANNOUNCE_BCAST:
-                    history_line = "[SYSTEM ANNOUNCEMENT]: " + received_msg.content;
-                    AddToHistory(history_line);
+                // --- 文件接收 ---
+                case MessageType::MSG_FILE_HEADER:
+                {
+                    // [关键] 群发时，自己也会收到广播，必须忽略
+                    if (rmsg.sender.name == name_buffer) break;
+
+                    if (g_file_state.is_receiving) g_file_state.file_stream.close();
+                    
+                    g_file_state.is_receiving = true;
+                    g_file_state.filename = rmsg.file_name;
+                    g_file_state.total_size = rmsg.file_size;
+                    g_file_state.received_size = 0;
+                    g_file_state.sender_name = rmsg.sender.name;
+                    
+                    std::string save_name = "recv_" + rmsg.file_name;
+                    g_file_state.file_stream.open(save_name, std::ios::binary);
+
+                    std::string target_key = (rmsg.chat_mode == ChatMode::MODE_GROUP) ? GROUP_ID : rmsg.sender.name;
+                    if (g_file_state.file_stream) {
+                        AddToHistory(target_key, "[System]: Incoming file '" + rmsg.file_name + "'...");
+                    } else {
+                        AddToHistory(target_key, "[System]: Failed to create file.");
+                        g_file_state.is_receiving = false;
+                    }
                     break;
+                }
                 
-                default:
-                    // 忽略 MSG_LOGIN_REQUEST 或其他未知类型
+                case MessageType::MSG_FILE_DATA:
+                {
+                    if (rmsg.sender.name == name_buffer) break; // 忽略自己的包
+
+                    if (g_file_state.is_receiving && g_file_state.sender_name == rmsg.sender.name) {
+                        g_file_state.file_stream.write(rmsg.content.data(), rmsg.content.size());
+                        g_file_state.received_size += rmsg.content.size();
+
+                        if (g_file_state.received_size >= g_file_state.total_size) {
+                            g_file_state.file_stream.close();
+                            g_file_state.is_receiving = false;
+                            
+                            std::string target_key = (rmsg.chat_mode == ChatMode::MODE_GROUP) ? GROUP_ID : rmsg.sender.name;
+                            AddToHistory(target_key, "[System]: File saved as 'recv_" + g_file_state.filename + "'.");
+                        }
+                    }
                     break;
+                }
+                default: break;
             }
         }
-        
-        // --- 5e. 渲染 --- (不变)
+
         ImGui::Render();
-        SDL_SetRenderDrawColor(renderer, (Uint8)(0.45f * 255), (Uint8)(0.55f * 255), (Uint8)(0.60f * 255), (Uint8)(1.00f * 255));
+        SDL_SetRenderDrawColor(renderer, 50, 50, 50, 255);
         SDL_RenderClear(renderer);
         ImGui_ImplSDLRenderer2_RenderDrawData(ImGui::GetDrawData(), renderer);
         SDL_RenderPresent(renderer);
     }
 
-    // --- 6. 清理 --- (不变)
-    g_peer->close_connection(); // 关闭网络连接
+    g_peer->close_connection();
     ImGui_ImplSDLRenderer2_Shutdown();
     ImGui_ImplSDL2_Shutdown();
     ImGui::DestroyContext();
     SDL_DestroyRenderer(renderer);
     SDL_DestroyWindow(window);
     SDL_Quit();
-
     return 0;
 }
